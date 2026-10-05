@@ -1,0 +1,10 @@
+﻿caja.db
+*.db
+*.db-journal
+facturas/
+config_correo.json
+clave_admin.json
+config_db.json
+__pycache__/
+build/
+dist/
