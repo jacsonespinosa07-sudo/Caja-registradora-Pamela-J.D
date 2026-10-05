@@ -8,11 +8,33 @@ import os
 
 import rutas
 
-DB_PATH = os.path.join(rutas.ruta_base(), "caja.db")
+DB_PATH, _DB_COMPARTIDA, _ERROR_CONFIG = rutas.config_db()
+
+
+def verificar_acceso():
+    """Devuelve None si la base está accesible, o un texto explicando el problema."""
+    if _ERROR_CONFIG:
+        return _ERROR_CONFIG
+    if not _DB_COMPARTIDA:
+        return None
+    carpeta = os.path.dirname(DB_PATH)
+    if not os.path.isdir(carpeta):
+        return (f"No se encuentra la carpeta de la base de datos:\n{carpeta}\n\n"
+                "Revisa que el PC principal esté encendido y conectado a la misma red.")
+    if not os.path.exists(DB_PATH):
+        return (f"No se encontró la base de datos en:\n{DB_PATH}\n\n"
+                "Copia ahí el archivo caja.db antes de abrir el programa.")
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        conn.close()
+    except sqlite3.Error as e:
+        return f"No se pudo abrir la base de datos:\n{DB_PATH}\n\n{e}"
+    return None
 
 
 def conectar():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -63,6 +85,7 @@ def _quitar_check_tipo(conn):
 def inicializar_db():
     """Crea las tablas si no existen. Se llama al arrancar la app."""
     conn = conectar()
+    conn.execute("PRAGMA journal_mode = DELETE")
     cur = conn.cursor()
 
     # ---------------- PRODUCTOS (sin CHECK en tipo) ----------------

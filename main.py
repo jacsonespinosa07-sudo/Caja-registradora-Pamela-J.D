@@ -1071,6 +1071,7 @@ class CajaRegistradoraApp(tk.Tk):
 
     def _al_cambiar_pestana(self, event=None):
         if self.notebook.index(self.notebook.select()) == 0:
+            self.cargar_catalogo()
             self.after(100, lambda: self.ent_scan_codigo.focus_set())
 
     # -----------------------------------------------------------------
@@ -2502,6 +2503,13 @@ class CajaRegistradoraApp(tk.Tk):
 # Punto de entrada de la aplicación
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    problema = db.verificar_acceso()
+    if problema:
+        raiz = tk.Tk()
+        raiz.withdraw()
+        messagebox.showerror("Base de datos no disponible", problema)
+        raiz.destroy()
+        sys.exit(1)
     db.inicializar_db()
     asegurar_esquema()
     asegurar_tablas()
