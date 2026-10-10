@@ -4,23 +4,33 @@ Caja Registradora - Venta de zapatos, moños,  y control de materiales.
 Cómo ejecutar:
     python main.py
 
-Requisitos: solo Python 3 (tkinter y sqlite3 vienen incluidos por defecto).
+Base de datos: MySQL o SQLite, según config_db.json (ver database.py).
 """
 import os
 import re
 import sys
 import calendar
-import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from datetime import datetime
+
+try:
+    import auto_migracion
+except Exception:
+    auto_migracion = None   
+from historial_peleteria import PanelHistorialPeleteria
+from credito_peleteria import PanelCreditoPeleteria
+import cierre_peleteria
+import caja_peleteria
 import seguridad
 import entradas
-
 import database as db
 import correo
 import factura
 import rutas
+import caja_extra
+from caja_extra import (METODOS_PAGO, STOCK_BAJO, TabCierreCaja, TabReportes,
+                        anular_venta_db)
 
 try:
     from PIL import Image, ImageTk
@@ -43,17 +53,20 @@ COLOR_TEXTO = "#4a3636"        # marrón oscuro, combina con el negro del logo
 COLOR_TEXTO_SUAVE = "#7a6363"
 COLOR_BLANCO = "#ffffff"
 COLOR_FILA_ALT = "#fff8f6"
-
-METODOS_PAGO = ["Efectivo", "Tarjeta", "Transferencia"]
-STOCK_BAJO = 3
+COLOR_ANULADA = "#a05a5a"      # texto de ventas anuladas/devueltas
+COLOR_STOCK_BAJO = "#c0392b"   # texto de productos con poco stock
 
 LOGO_HEADER_PATH = rutas.ruta_recurso("assets", "logo_header.png")
 LOGO_ICON_PATH = rutas.ruta_recurso("assets", "logo_icon.png")
 
 # Si es True, la Caja exige el correo del comprador para poder cobrar
 CORREO_OBLIGATORIO = True
-# Clave para poder eliminar ventas del historial (cámbiala por la tuya)
-CLAVE_BORRADO = "4551"
+
+# Tipos de producto que aparecen al crear/editar un producto
+TIPOS_PRODUCTO = ["Zapato deportivo", "Bolichero", "Sandalia", "Moño", "Accesorio", "Otro"]
+
+# Cada cuántos milisegundos se revisa si la otra caja guardó algo
+INTERVALO_REVISION_MS = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -84,796 +97,6 @@ def configurar_filas_alternadas(tree):
 def tag_fila(indice):
     return "par" if indice % 2 == 0 else "impar"
 
-
-def asegurar_esquema():
-    """Crea lo que falta en la base de datos para el crédito y los códigos de
-    barras de materiales. Es seguro correrla en cada arranque: no borra ni
-    cambia datos existentes."""
-    conn = db.conectar()
-    cur = conn.cursor()
-
-    def columnas(tabla):
-        cur.execute(f"PRAGMA table_info({tabla})")
-        return [c[1] for c in cur.fetchall()]
-
-    if "codigo_barras" not in columnas("materiales"):
-        cur.execute("ALTER TABLE materiales ADD COLUMN codigo_barras TEXT")
-
-    if "forma_pago" not in columnas("ventas"):
-        cur.execute("ALTER TABLE ventas ADD COLUMN forma_pago TEXT DEFAULT 'Contado'")
-
-    if "cliente_correo" not in columnas("ventas"):
-        cur.execute("ALTER TABLE ventas ADD COLUMN cliente_correo TEXT")
-
-    if "correo" not in columnas("clientes"):
-        cur.execute("ALTER TABLE clientes ADD COLUMN correo TEXT")
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS abonos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            venta_id INTEGER NOT NULL,
-            fecha TEXT NOT NULL,
-            monto REAL NOT NULL,
-            nota TEXT,
-            FOREIGN KEY (venta_id) REFERENCES ventas(id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# MEJORAS INTEGRADAS: cierre de caja, reportes y anulaciones
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------------
-def _hoy():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def _ahora():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _hora():
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def _fmt(valor):
-    return f"${valor:,.0f}"
-
-
-def _a_numero(texto):
-    digitos = re.sub(r"[^\d]", "", texto or "")
-    return float(digitos) if digitos else None
-
-
-def _fecha_valida(texto):
-    try:
-        datetime.strptime(texto, "%Y-%m-%d")
-        return True
-    except ValueError:
-        return False
-
-
-def _crear_tree(parent, columnas, alto=None, selectmode="browse"):
-    tree = ttk.Treeview(parent, columns=[c[0] for c in columnas],
-                        show="headings", selectmode=selectmode,
-                        **({"height": alto} if alto else {}))
-    for cid, txt, ancho, anchor in columnas:
-        tree.heading(cid, text=txt)
-        tree.column(cid, width=ancho, anchor=anchor)
-    tree.tag_configure("par", background=COLOR_FILA_ALT)
-    tree.tag_configure("impar", background=COLOR_BLANCO)
-    return tree
-
-
-def _llenar(tree, filas):
-    for item in tree.get_children():
-        tree.delete(item)
-    for i, valores in enumerate(filas):
-        tree.insert("", "end", tags=("par" if i % 2 == 0 else "impar",), values=valores)
-
-
-# ---------------------------------------------------------------------------
-# Base de datos: columnas y tablas nuevas (seguro de correr en cada arranque)
-# ---------------------------------------------------------------------------
-def asegurar_tablas():
-    conn = db.conectar()
-    try:
-        cur = conn.cursor()
-
-        def columnas(tabla):
-            cur.execute(f"PRAGMA table_info({tabla})")
-            return [c[1] for c in cur.fetchall()]
-
-        cols_ventas = columnas("ventas")
-        for nombre, ddl in [
-            ("estado", "TEXT DEFAULT 'Activa'"),
-            ("motivo_anulacion", "TEXT"),
-            ("fecha_anulacion", "TEXT"),
-            ("metodo_pago", "TEXT DEFAULT 'Efectivo'"),
-        ]:
-            if nombre not in cols_ventas:
-                cur.execute(f"ALTER TABLE ventas ADD COLUMN {nombre} {ddl}")
-
-        if "metodo_pago" not in columnas("abonos"):
-            cur.execute("ALTER TABLE abonos ADD COLUMN metodo_pago TEXT DEFAULT 'Efectivo'")
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS caja_aperturas (
-                fecha TEXT PRIMARY KEY,
-                monto_inicial REAL NOT NULL,
-                hora TEXT
-            )""")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS caja_movimientos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fecha TEXT NOT NULL,
-                hora TEXT,
-                tipo TEXT NOT NULL,
-                monto REAL NOT NULL,
-                concepto TEXT
-            )""")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cierres_caja (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fecha TEXT NOT NULL,
-                fecha_cierre TEXT,
-                efectivo_esperado REAL,
-                efectivo_contado REAL,
-                diferencia REAL,
-                nota TEXT
-            )""")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Consultas (separadas de la interfaz)
-# ---------------------------------------------------------------------------
-def resumen_dia(fecha):
-    """Todo lo que entró y salió de la caja en un día (AAAA-MM-DD)."""
-    like = f"{fecha}%"
-    conn = db.conectar()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT monto_inicial FROM caja_aperturas WHERE fecha = ?", (fecha,))
-        fila = cur.fetchone()
-        apertura = fila[0] if fila else None
-
-        cur.execute("""SELECT COALESCE(metodo_pago, 'Efectivo'), COALESCE(SUM(total), 0)
-                       FROM ventas
-                       WHERE fecha LIKE ? AND COALESCE(forma_pago, 'Contado') = 'Contado'
-                         AND COALESCE(estado, 'Activa') = 'Activa'
-                       GROUP BY 1""", (like,))
-        ventas = dict(cur.fetchall())
-
-        cur.execute("""SELECT COALESCE(a.metodo_pago, 'Efectivo'), COALESCE(SUM(a.monto), 0)
-                       FROM abonos a JOIN ventas v ON v.id = a.venta_id
-                       WHERE a.fecha LIKE ? AND COALESCE(v.estado, 'Activa') = 'Activa'
-                       GROUP BY 1""", (like,))
-        abonos = dict(cur.fetchall())
-
-        cur.execute("""SELECT COALESCE(SUM(total), 0) FROM ventas
-                       WHERE fecha LIKE ? AND forma_pago = 'Crédito'
-                         AND COALESCE(estado, 'Activa') = 'Activa'""", (like,))
-        credito = cur.fetchone()[0]
-
-        cur.execute("""SELECT tipo, COALESCE(SUM(monto), 0) FROM caja_movimientos
-                       WHERE fecha = ? GROUP BY tipo""", (fecha,))
-        movs = dict(cur.fetchall())
-
-        cur.execute("""SELECT COUNT(*), COALESCE(SUM(total), 0) FROM ventas
-                       WHERE fecha_anulacion LIKE ? AND COALESCE(estado, 'Activa') != 'Activa'""",
-                    (like,))
-        n_anul, total_anul = cur.fetchone()
-    finally:
-        conn.close()
-
-    gastos = movs.get("Gasto", 0)
-    retiros = movs.get("Retiro", 0)
-    esperado = ((apertura or 0) + ventas.get("Efectivo", 0) + abonos.get("Efectivo", 0)
-                - gastos - retiros)
-    return {
-        "apertura": apertura, "ventas": ventas, "abonos": abonos, "credito": credito,
-        "gastos": gastos, "retiros": retiros, "esperado": esperado,
-        "total_vendido": sum(ventas.values()) + credito,
-        "n_anuladas": n_anul, "total_anuladas": total_anul,
-    }
-
-
-def datos_reporte(desde, hasta):
-    """Datos para la pestaña de reportes entre dos fechas (incluidas)."""
-    conn = db.conectar()
-    try:
-        cur = conn.cursor()
-        activa = "COALESCE(estado, 'Activa') = 'Activa'"
-
-        cur.execute(f"""SELECT substr(fecha, 1, 10) AS d, COUNT(*), SUM(total) FROM ventas
-                        WHERE substr(fecha, 1, 10) BETWEEN ? AND ? AND {activa}
-                        GROUP BY d ORDER BY d DESC""", (desde, hasta))
-        por_dia = cur.fetchall()
-
-        cur.execute("""SELECT d.nombre_producto, SUM(d.cantidad), SUM(d.subtotal)
-                       FROM venta_detalle d JOIN ventas v ON v.id = d.venta_id
-                       WHERE substr(v.fecha, 1, 10) BETWEEN ? AND ?
-                         AND COALESCE(v.estado, 'Activa') = 'Activa'
-                       GROUP BY d.nombre_producto
-                       ORDER BY SUM(d.cantidad) DESC, SUM(d.subtotal) DESC LIMIT 30""",
-                    (desde, hasta))
-        top = cur.fetchall()
-
-        cur.execute("""SELECT metodo, SUM(monto) FROM (
-                          SELECT COALESCE(metodo_pago, 'Efectivo') AS metodo, total AS monto
-                          FROM ventas
-                          WHERE substr(fecha, 1, 10) BETWEEN ? AND ?
-                            AND COALESCE(forma_pago, 'Contado') = 'Contado'
-                            AND COALESCE(estado, 'Activa') = 'Activa'
-                          UNION ALL
-                          SELECT COALESCE(a.metodo_pago, 'Efectivo'), a.monto
-                          FROM abonos a JOIN ventas v ON v.id = a.venta_id
-                          WHERE substr(a.fecha, 1, 10) BETWEEN ? AND ?
-                            AND COALESCE(v.estado, 'Activa') = 'Activa'
-                       ) GROUP BY metodo ORDER BY SUM(monto) DESC""",
-                    (desde, hasta, desde, hasta))
-        metodos = cur.fetchall()
-
-        cur.execute("""SELECT COALESCE(SUM(v.total - COALESCE(
-                           (SELECT SUM(a.monto) FROM abonos a WHERE a.venta_id = v.id), 0)), 0)
-                       FROM ventas v
-                       WHERE v.forma_pago = 'Crédito' AND COALESCE(v.estado, 'Activa') = 'Activa'""")
-        por_cobrar = cur.fetchone()[0]
-
-        cur.execute(f"""SELECT COUNT(*), COALESCE(SUM(total), 0) FROM ventas
-                        WHERE substr(fecha, 1, 10) BETWEEN ? AND ?
-                          AND COALESCE(estado, 'Activa') != 'Activa'""", (desde, hasta))
-        n_anul, total_anul = cur.fetchone()
-
-        cur.execute("""SELECT tipo, COALESCE(SUM(monto), 0) FROM caja_movimientos
-                       WHERE fecha BETWEEN ? AND ? GROUP BY tipo""", (desde, hasta))
-        movs = dict(cur.fetchall())
-
-        cur.execute("SELECT nombre, stock FROM productos WHERE stock <= ? ORDER BY stock, nombre",
-                    (STOCK_BAJO,))
-        stock_bajo = cur.fetchall()
-    finally:
-        conn.close()
-
-    return {
-        "por_dia": por_dia, "top": top, "metodos": metodos, "por_cobrar": por_cobrar,
-        "n_ventas": sum(f[1] for f in por_dia), "total": sum(f[2] for f in por_dia),
-        "n_anuladas": n_anul, "total_anuladas": total_anul,
-        "gastos": movs.get("Gasto", 0), "retiros": movs.get("Retiro", 0),
-        "stock_bajo": stock_bajo,
-    }
-
-
-def anular_venta_db(venta_id, estado, motivo):
-    """Marca la venta como 'Anulada' o 'Devuelta', devuelve los productos al
-    stock y la deja en el historial (no se borra nada)."""
-    conn = db.conectar()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COALESCE(estado, 'Activa') FROM ventas WHERE id = ?", (venta_id,))
-        fila = cur.fetchone()
-        if not fila:
-            raise ValueError("La venta no existe.")
-        if fila[0] != "Activa":
-            raise ValueError(f"La venta ya está marcada como {fila[0]}.")
-        cur.execute("SELECT producto_id, cantidad FROM venta_detalle WHERE venta_id = ?", (venta_id,))
-        for producto_id, cantidad in cur.fetchall():
-            cur.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (cantidad, producto_id))
-        cur.execute("""UPDATE ventas SET estado = ?, motivo_anulacion = ?, fecha_anulacion = ?
-                       WHERE id = ?""", (estado, motivo, _ahora(), venta_id))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def estado_venta(venta_id):
-    conn = db.conectar()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COALESCE(estado, 'Activa') FROM ventas WHERE id = ?", (venta_id,))
-        fila = cur.fetchone()
-    finally:
-        conn.close()
-    return fila[0] if fila else None
-
-
-# ---------------------------------------------------------------------------
-# Ventanitas de diálogo
-# ---------------------------------------------------------------------------
-def pedir_monto_y_metodo(parent, titulo, mensaje):
-    """Pide un monto y el método de pago. Devuelve (texto_monto, metodo) o None."""
-    dlg = tk.Toplevel(parent)
-    dlg.title(titulo)
-    dlg.configure(bg=COLOR_FONDO)
-    dlg.resizable(False, False)
-    dlg.transient(parent)
-    resultado = {"valor": None}
-
-    ttk.Label(dlg, text=mensaje, justify="left").grid(
-        row=0, column=0, columnspan=2, padx=14, pady=(14, 8), sticky="w")
-    ttk.Label(dlg, text="Monto:").grid(row=1, column=0, padx=(14, 4), pady=4, sticky="e")
-    ent = ttk.Entry(dlg, width=16)
-    ent.grid(row=1, column=1, padx=(0, 14), pady=4, sticky="w")
-    ttk.Label(dlg, text="Método de pago:").grid(row=2, column=0, padx=(14, 4), pady=4, sticky="e")
-    combo = ttk.Combobox(dlg, values=METODOS_PAGO, state="readonly", width=14)
-    combo.set("Efectivo")
-    combo.grid(row=2, column=1, padx=(0, 14), pady=4, sticky="w")
-
-    def aceptar(e=None):
-        resultado["valor"] = (ent.get().strip(), combo.get())
-        dlg.destroy()
-
-    botones = ttk.Frame(dlg)
-    botones.grid(row=3, column=0, columnspan=2, pady=12)
-    ttk.Button(botones, text="Aceptar", command=aceptar).pack(side="left", padx=6)
-    ttk.Button(botones, text="Cancelar", command=dlg.destroy).pack(side="left", padx=6)
-    ent.bind("<Return>", aceptar)
-    dlg.bind("<Escape>", lambda e: dlg.destroy())
-
-    dlg.wait_visibility()
-    dlg.grab_set()
-    ent.focus_set()
-    parent.wait_window(dlg)
-    return resultado["valor"]
-
-
-def pedir_anulacion(parent, venta_id, cliente, total):
-    """Pregunta si es anulación o devolución y el motivo. Devuelve (estado, motivo) o None."""
-    dlg = tk.Toplevel(parent)
-    dlg.title("Anular / devolver venta")
-    dlg.configure(bg=COLOR_FONDO)
-    dlg.resizable(False, False)
-    dlg.transient(parent)
-    resultado = {"valor": None}
-
-    ttk.Label(
-        dlg, justify="left",
-        text=f"Venta #{venta_id} - {cliente}\nTotal: {_fmt(total)}\n\n"
-             "Los productos vuelven al stock. La venta queda en el historial\n"
-             "marcada con su motivo (no se borra)."
-    ).grid(row=0, column=0, columnspan=2, padx=14, pady=(14, 8), sticky="w")
-
-    ttk.Label(dlg, text="Tipo:").grid(row=1, column=0, padx=(14, 4), pady=4, sticky="e")
-    combo = ttk.Combobox(dlg, state="readonly", width=34,
-                         values=["Anulada (error al registrar)", "Devuelta (el cliente devolvió)"])
-    combo.set("Anulada (error al registrar)")
-    combo.grid(row=1, column=1, padx=(0, 14), pady=4, sticky="w")
-
-    ttk.Label(dlg, text="Motivo *:").grid(row=2, column=0, padx=(14, 4), pady=4, sticky="e")
-    ent = ttk.Entry(dlg, width=37)
-    ent.grid(row=2, column=1, padx=(0, 14), pady=4, sticky="w")
-
-    def aceptar(e=None):
-        motivo = ent.get().strip()
-        if not motivo:
-            messagebox.showwarning("Falta el motivo", "Escribe el motivo.", parent=dlg)
-            ent.focus_set()
-            return
-        estado = "Anulada" if combo.get().startswith("Anulada") else "Devuelta"
-        resultado["valor"] = (estado, motivo)
-        dlg.destroy()
-
-    botones = ttk.Frame(dlg)
-    botones.grid(row=3, column=0, columnspan=2, pady=12)
-    ttk.Button(botones, text="Continuar", command=aceptar).pack(side="left", padx=6)
-    ttk.Button(botones, text="Cancelar", command=dlg.destroy).pack(side="left", padx=6)
-    ent.bind("<Return>", aceptar)
-    dlg.bind("<Escape>", lambda e: dlg.destroy())
-
-    dlg.wait_visibility()
-    dlg.grab_set()
-    ent.focus_set()
-    parent.wait_window(dlg)
-    return resultado["valor"]
-
-
-# ---------------------------------------------------------------------------
-# Pestaña: Cierre de caja
-# ---------------------------------------------------------------------------
-class TabCierreCaja(ttk.Frame):
-    def __init__(self, parent, app):
-        super().__init__(parent)
-        self.app = app
-        self._construir()
-        self.cargar()
-        self.bind("<Map>", self._al_mostrar)
-
-    def _al_mostrar(self, event=None):
-        if event is not None and event.widget is not self:
-            return
-        self.cargar()
-
-    def _construir(self):
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=2)
-        self.rowconfigure(3, weight=1)
-
-        # ---- Barra superior: fecha + apertura ----
-        top = ttk.LabelFrame(self, text="💰 Caja del día")
-        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 0))
-        ttk.Label(top, text="Fecha:").pack(side="left", padx=(8, 4), pady=8)
-        self.ent_fecha = ttk.Entry(top, width=11)
-        self.ent_fecha.insert(0, _hoy())
-        self.ent_fecha.pack(side="left")
-        self.ent_fecha.bind("<Return>", lambda e: self.cargar())
-        ttk.Button(top, text="📅", width=3,
-                   command=lambda: self.app.abrir_calendario(self.ent_fecha)).pack(side="left", padx=(2, 6))
-        ttk.Button(top, text="Ver", command=self.cargar).pack(side="left")
-        ttk.Button(top, text="Hoy", command=self._ir_hoy).pack(side="left", padx=4)
-        self.lbl_estado = ttk.Label(top, text="", style="Subtitulo.TLabel")
-        self.lbl_estado.pack(side="left", padx=16)
-        ttk.Button(top, text="🔓 Abrir caja / cambiar efectivo inicial",
-                   command=self.abrir_caja).pack(side="right", padx=8)
-
-        # ---- Resumen (izquierda) ----
-        izq = ttk.LabelFrame(self, text="Resumen del día")
-        izq.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        izq.rowconfigure(0, weight=1)
-        izq.columnconfigure(0, weight=1)
-        self.tree_res = _crear_tree(izq, [
-            ("concepto", "Concepto", 280, "w"),
-            ("monto", "Monto", 120, "e"),
-        ], selectmode="none")
-        self.tree_res.tag_configure("total", background=COLOR_HEADER, font=("Segoe UI", 10, "bold"))
-        self.tree_res.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-
-        # ---- Gastos y retiros (derecha) ----
-        der = ttk.LabelFrame(self, text="Gastos y retiros de efectivo")
-        der.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
-        der.rowconfigure(1, weight=1)
-        der.columnconfigure(0, weight=1)
-
-        form = ttk.Frame(der)
-        form.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 0))
-        self.combo_mov_tipo = ttk.Combobox(form, values=["Gasto", "Retiro"], state="readonly", width=8)
-        self.combo_mov_tipo.set("Gasto")
-        self.combo_mov_tipo.pack(side="left")
-        ttk.Label(form, text="Monto:").pack(side="left", padx=(8, 2))
-        self.ent_mov_monto = ttk.Entry(form, width=10)
-        self.ent_mov_monto.pack(side="left")
-        ttk.Label(form, text="Concepto:").pack(side="left", padx=(8, 2))
-        self.ent_mov_concepto = ttk.Entry(form)
-        self.ent_mov_concepto.pack(side="left", fill="x", expand=True)
-        self.ent_mov_concepto.bind("<Return>", lambda e: self.registrar_movimiento())
-        ttk.Button(form, text="➕ Registrar", command=self.registrar_movimiento).pack(side="left", padx=(8, 0))
-
-        self.tree_mov = _crear_tree(der, [
-            ("hora", "Hora", 70, "center"),
-            ("tipo", "Tipo", 70, "center"),
-            ("monto", "Monto", 90, "e"),
-            ("concepto", "Concepto", 200, "w"),
-        ])
-        self.tree_mov.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        ttk.Button(der, text="🗑 Eliminar", command=self.eliminar_movimiento).grid(
-            row=1, column=1, padx=(0, 8), pady=6, sticky="n")
-
-        # ---- Cerrar caja ----
-        cierre = ttk.LabelFrame(self, text="Cerrar caja (cuenta el efectivo y escríbelo aquí)")
-        cierre.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        ttk.Label(cierre, text="Efectivo contado:").pack(side="left", padx=(8, 4), pady=8)
-        self.ent_contado = ttk.Entry(cierre, width=14)
-        self.ent_contado.pack(side="left")
-        ttk.Label(cierre, text="Nota:").pack(side="left", padx=(12, 4))
-        self.ent_nota_cierre = ttk.Entry(cierre)
-        self.ent_nota_cierre.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Button(cierre, text="🔒 Cerrar caja", command=self.cerrar_caja).pack(side="right", padx=8, pady=6)
-
-        # ---- Cierres anteriores ----
-        hist = ttk.LabelFrame(self, text="Cierres anteriores")
-        hist.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=6, pady=(0, 6))
-        hist.rowconfigure(0, weight=1)
-        hist.columnconfigure(0, weight=1)
-        self.tree_cierres = _crear_tree(hist, [
-            ("fecha", "Fecha", 100, "center"),
-            ("esperado", "Debía haber", 110, "e"),
-            ("contado", "Se contó", 110, "e"),
-            ("dif", "Diferencia", 110, "e"),
-            ("nota", "Nota", 300, "w"),
-        ], alto=4)
-        self.tree_cierres.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-
-    # ------------------------------------------------------------------
-    def _fecha(self):
-        f = self.ent_fecha.get().strip()
-        if not _fecha_valida(f):
-            messagebox.showerror("Fecha inválida",
-                                 "Escribe la fecha como AAAA-MM-DD, por ejemplo 2026-10-05.")
-            return None
-        return f
-
-    def _ir_hoy(self):
-        self.ent_fecha.delete(0, "end")
-        self.ent_fecha.insert(0, _hoy())
-        self.cargar()
-
-    def cargar(self):
-        fecha = self._fecha()
-        if not fecha:
-            return
-        r = resumen_dia(fecha)
-
-        if r["apertura"] is None:
-            self.lbl_estado.config(text="⚠ Caja sin abrir (no hay efectivo inicial)")
-        else:
-            self.lbl_estado.config(text=f"Efectivo inicial: {_fmt(r['apertura'])}")
-
-        tarjeta = r["ventas"].get("Tarjeta", 0) + r["abonos"].get("Tarjeta", 0)
-        transf = r["ventas"].get("Transferencia", 0) + r["abonos"].get("Transferencia", 0)
-        filas = [
-            ("Efectivo inicial (apertura)",
-             "Sin abrir" if r["apertura"] is None else _fmt(r["apertura"]), None),
-            ("+ Ventas de contado en efectivo", _fmt(r["ventas"].get("Efectivo", 0)), None),
-            ("+ Abonos de crédito en efectivo", _fmt(r["abonos"].get("Efectivo", 0)), None),
-            ("− Gastos", _fmt(r["gastos"]), None),
-            ("− Retiros", _fmt(r["retiros"]), None),
-            ("= EFECTIVO QUE DEBE HABER", _fmt(r["esperado"]), "total"),
-            ("", "", None),
-            ("Tarjeta (ventas + abonos)", _fmt(tarjeta), None),
-            ("Transferencia (ventas + abonos)", _fmt(transf), None),
-            ("Ventas a crédito del día (total)", _fmt(r["credito"]), None),
-            ("TOTAL VENDIDO (contado + crédito)", _fmt(r["total_vendido"]), "total"),
-            ("Ventas anuladas/devueltas ese día",
-             f"{r['n_anuladas']} ({_fmt(r['total_anuladas'])})", None),
-        ]
-        for item in self.tree_res.get_children():
-            self.tree_res.delete(item)
-        for i, (concepto, monto, tag) in enumerate(filas):
-            tags = (tag,) if tag else (("par" if i % 2 == 0 else "impar"),)
-            self.tree_res.insert("", "end", tags=tags, values=(concepto, monto))
-
-        conn = db.conectar()
-        try:
-            cur = conn.cursor()
-            cur.execute("""SELECT id, COALESCE(hora, ''), tipo, monto, COALESCE(concepto, '')
-                           FROM caja_movimientos WHERE fecha = ? ORDER BY id DESC""", (fecha,))
-            movs = cur.fetchall()
-            cur.execute("""SELECT fecha, efectivo_esperado, efectivo_contado, diferencia, COALESCE(nota, '')
-                           FROM cierres_caja ORDER BY id DESC LIMIT 15""")
-            cierres = cur.fetchall()
-        finally:
-            conn.close()
-
-        for item in self.tree_mov.get_children():
-            self.tree_mov.delete(item)
-        for i, (mid, hora, tipo, monto, concepto) in enumerate(movs):
-            self.tree_mov.insert("", "end", iid=str(mid), tags=("par" if i % 2 == 0 else "impar",),
-                                 values=(hora, tipo, _fmt(monto), concepto))
-
-        _llenar(self.tree_cierres, [
-            (f, _fmt(e or 0), _fmt(c or 0),
-             ("+" if (d or 0) > 0 else "") + _fmt(d or 0), n)
-            for f, e, c, d, n in cierres
-        ])
-
-    # ------------------------------------------------------------------
-    def abrir_caja(self):
-        fecha = self._fecha()
-        if not fecha:
-            return
-        texto = simpledialog.askstring(
-            "Abrir caja",
-            f"Efectivo con el que empieza la caja el {fecha}\n(si empieza en cero, escribe 0):",
-            parent=self.app)
-        if texto is None:
-            return
-        monto = _a_numero(texto)
-        if monto is None:
-            messagebox.showerror("Monto inválido", "Escribe un número.")
-            return
-        conn = db.conectar()
-        try:
-            conn.execute("INSERT OR REPLACE INTO caja_aperturas (fecha, monto_inicial, hora) VALUES (?, ?, ?)",
-                         (fecha, monto, _hora()))
-            conn.commit()
-        finally:
-            conn.close()
-        self.cargar()
-
-    def registrar_movimiento(self):
-        fecha = self._fecha()
-        if not fecha:
-            return
-        monto = _a_numero(self.ent_mov_monto.get())
-        concepto = self.ent_mov_concepto.get().strip()
-        if not monto or monto <= 0:
-            messagebox.showerror("Monto inválido", "Escribe un monto mayor a 0.")
-            self.ent_mov_monto.focus_set()
-            return
-        if not concepto:
-            messagebox.showwarning("Falta el concepto", "Escribe en qué se gastó o para qué fue el retiro.")
-            self.ent_mov_concepto.focus_set()
-            return
-        conn = db.conectar()
-        try:
-            conn.execute("""INSERT INTO caja_movimientos (fecha, hora, tipo, monto, concepto)
-                            VALUES (?, ?, ?, ?, ?)""",
-                         (fecha, _hora(), self.combo_mov_tipo.get(), monto, concepto))
-            conn.commit()
-        finally:
-            conn.close()
-        self.ent_mov_monto.delete(0, "end")
-        self.ent_mov_concepto.delete(0, "end")
-        self.cargar()
-
-    def eliminar_movimiento(self):
-        sel = self.tree_mov.selection()
-        if not sel:
-            messagebox.showwarning("Seleccionar", "Selecciona un gasto o retiro de la lista.")
-            return
-        if not messagebox.askyesno("Eliminar", "¿Eliminar este movimiento de caja?"):
-            return
-        if not seguridad.pedir_clave(self.app, "eliminar el movimiento"):
-            return
-        conn = db.conectar()
-        try:
-            conn.execute("DELETE FROM caja_movimientos WHERE id = ?", (sel[0],))
-            conn.commit()
-        finally:
-            conn.close()
-        self.cargar()
-
-    def cerrar_caja(self):
-        fecha = self._fecha()
-        if not fecha:
-            return
-        r = resumen_dia(fecha)
-        contado = _a_numero(self.ent_contado.get())
-        if contado is None:
-            messagebox.showerror("Falta el efectivo", "Escribe cuánto efectivo contaste en la caja.")
-            self.ent_contado.focus_set()
-            return
-        if r["apertura"] is None and not messagebox.askyesno(
-                "Caja sin abrir",
-                "Este día no tiene efectivo inicial registrado (se toma como $0).\n\n¿Cerrar de todas formas?"):
-            return
-
-        conn = db.conectar()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM cierres_caja WHERE fecha = ?", (fecha,))
-            ya_cerrada = cur.fetchone()[0] > 0
-        finally:
-            conn.close()
-        if ya_cerrada and not messagebox.askyesno(
-                "Ya hay un cierre", f"El {fecha} ya tiene un cierre registrado.\n\n¿Registrar otro?"):
-            return
-
-        diferencia = contado - r["esperado"]
-        if not messagebox.askyesno(
-                "Confirmar cierre",
-                f"Debía haber: {_fmt(r['esperado'])}\nSe contó:    {_fmt(contado)}\n"
-                f"Diferencia:  {_fmt(diferencia)}\n\n¿Cerrar la caja?"):
-            return
-
-        conn = db.conectar()
-        try:
-            conn.execute("""INSERT INTO cierres_caja
-                            (fecha, fecha_cierre, efectivo_esperado, efectivo_contado, diferencia, nota)
-                            VALUES (?, ?, ?, ?, ?, ?)""",
-                         (fecha, _ahora(), r["esperado"], contado, diferencia,
-                          self.ent_nota_cierre.get().strip()))
-            conn.commit()
-        finally:
-            conn.close()
-
-        if abs(diferencia) < 0.5:
-            messagebox.showinfo("Caja cerrada", "La caja cuadra perfecto. ✔")
-        elif diferencia > 0:
-            messagebox.showinfo("Caja cerrada", f"Caja cerrada con un SOBRANTE de {_fmt(diferencia)}.")
-        else:
-            messagebox.showwarning("Caja cerrada", f"Caja cerrada con un FALTANTE de {_fmt(-diferencia)}.")
-        self.ent_contado.delete(0, "end")
-        self.ent_nota_cierre.delete(0, "end")
-        self.cargar()
-
-
-# ---------------------------------------------------------------------------
-# Pestaña: Reportes
-# ---------------------------------------------------------------------------
-class TabReportes(ttk.Frame):
-    def __init__(self, parent, app):
-        super().__init__(parent)
-        self.app = app
-        self._construir()
-        self.cargar()
-        self.bind("<Map>", self._al_mostrar)
-
-    def _al_mostrar(self, event=None):
-        if event is not None and event.widget is not self:
-            return
-        self.cargar()
-
-    def _construir(self):
-        self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(2, weight=1)
-        self.rowconfigure(3, weight=1)
-
-        top = ttk.LabelFrame(self, text="📈 Reportes")
-        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 0))
-        ttk.Label(top, text="Desde:").pack(side="left", padx=(8, 4), pady=8)
-        self.ent_desde = ttk.Entry(top, width=11)
-        self.ent_desde.pack(side="left")
-        ttk.Button(top, text="📅", width=3,
-                   command=lambda: self.app.abrir_calendario(self.ent_desde)).pack(side="left", padx=(2, 10))
-        ttk.Label(top, text="Hasta:").pack(side="left", padx=(0, 4))
-        self.ent_hasta = ttk.Entry(top, width=11)
-        self.ent_hasta.pack(side="left")
-        ttk.Button(top, text="📅", width=3,
-                   command=lambda: self.app.abrir_calendario(self.ent_hasta)).pack(side="left", padx=(2, 10))
-        for e in (self.ent_desde, self.ent_hasta):
-            e.bind("<Return>", lambda ev: self.cargar())
-        ttk.Button(top, text="Buscar", command=self.cargar).pack(side="left", padx=4)
-        ttk.Button(top, text="Hoy", command=self._hoy).pack(side="left", padx=4)
-        ttk.Button(top, text="Este mes", command=self._este_mes).pack(side="left", padx=4)
-        self._este_mes(recargar=False)
-
-        self.lbl_resumen = ttk.Label(self, text="", style="Subtitulo.TLabel", wraplength=900, justify="left")
-        self.lbl_resumen.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=6)
-
-        def caja(texto, fila, col, columnas):
-            lf = ttk.LabelFrame(self, text=texto)
-            lf.grid(row=fila, column=col, sticky="nsew", padx=6, pady=6)
-            lf.rowconfigure(0, weight=1)
-            lf.columnconfigure(0, weight=1)
-            tree = _crear_tree(lf, columnas)
-            tree.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-            return tree
-
-        self.tree_dia = caja("Ventas por día", 2, 0, [
-            ("fecha", "Fecha", 100, "center"), ("n", "Ventas", 70, "center"), ("total", "Total", 110, "e")])
-        self.tree_top = caja("Productos más vendidos", 2, 1, [
-            ("prod", "Producto", 220, "w"), ("cant", "Unidades", 80, "center"), ("total", "Total", 110, "e")])
-        self.tree_metodos = caja("Dinero recibido por método de pago", 3, 0, [
-            ("metodo", "Método", 160, "w"), ("total", "Total", 120, "e")])
-        self.tree_bajo = caja(f"⚠ Stock bajo (de {STOCK_BAJO} unidades o menos)", 3, 1, [
-            ("prod", "Producto", 240, "w"), ("stock", "Stock", 80, "center")])
-
-    def _hoy(self):
-        hoy = _hoy()
-        self.ent_desde.delete(0, "end"); self.ent_desde.insert(0, hoy)
-        self.ent_hasta.delete(0, "end"); self.ent_hasta.insert(0, hoy)
-        self.cargar()
-
-    def _este_mes(self, recargar=True):
-        hoy = datetime.now()
-        self.ent_desde.delete(0, "end"); self.ent_desde.insert(0, hoy.strftime("%Y-%m-01"))
-        self.ent_hasta.delete(0, "end"); self.ent_hasta.insert(0, hoy.strftime("%Y-%m-%d"))
-        if recargar:
-            self.cargar()
-
-    def cargar(self):
-        desde = self.ent_desde.get().strip()
-        hasta = self.ent_hasta.get().strip()
-        if not (_fecha_valida(desde) and _fecha_valida(hasta)):
-            messagebox.showerror("Fecha inválida", "Escribe las fechas como AAAA-MM-DD.")
-            return
-        if desde > hasta:
-            messagebox.showerror("Fechas al revés", "La fecha 'Desde' no puede ser después de 'Hasta'.")
-            return
-
-        d = datos_reporte(desde, hasta)
-        self.lbl_resumen.config(text=(
-            f"Vendido: {_fmt(d['total'])} en {d['n_ventas']} ventas   |   "
-            f"Anuladas/devueltas: {d['n_anuladas']} ({_fmt(d['total_anuladas'])})   |   "
-            f"Gastos: {_fmt(d['gastos'])}   |   Retiros: {_fmt(d['retiros'])}   |   "
-            f"Por cobrar (crédito, total): {_fmt(d['por_cobrar'])}"))
-
-        _llenar(self.tree_dia, [(f, n, _fmt(t or 0)) for f, n, t in d["por_dia"]])
-        _llenar(self.tree_top, [(p, f"{c:g}", _fmt(t or 0)) for p, c, t in d["top"]])
-        _llenar(self.tree_metodos, [(m, _fmt(t or 0)) for m, t in d["metodos"]])
-        _llenar(self.tree_bajo, [(p, s) for p, s in d["stock_bajo"]])
 
 # ---------------------------------------------------------------------------
 # Ventana emergente de calendario (sin librerías externas) para elegir fechas
@@ -1007,7 +230,7 @@ class CalendarioPopup(tk.Toplevel):
 class CajaRegistradoraApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{NOMBRE_NEGOCIO} - Caja Registradora")
+        self.title(f"{NOMBRE_NEGOCIO} - Caja Registradora   [{db.DB_PATH}]")
         self.geometry("1050x700")
         self.minsize(950, 620)
         self.configure(bg=COLOR_FONDO)
@@ -1015,6 +238,7 @@ class CajaRegistradoraApp(tk.Tk):
         self.carrito = []  # lista de dicts: producto_id, nombre, precio, cantidad
         self.escala = 1.0  # nivel de zoom actual (1.0 = 100%)
         self._cliente_seleccionado_id = None  # id del cliente elegido en la Caja (None = cliente libre)
+        self._clientes_disponibles = []
 
         self._crear_estilos()
         self._construir_encabezado()
@@ -1038,14 +262,19 @@ class CajaRegistradoraApp(tk.Tk):
         notebook.add(self.tab_entradas, text="📥 Entrada")
 
         notebook.add(self.tab_clientes, text="🏢 Clientes")
-        notebook.add(self.tab_credito, text="💳 Crédito")
+        notebook.add(self.tab_credito, text="💳 Crédito Peleteria")
         notebook.add(self.tab_historial, text="📊 Historial")
 
-        self.tab_cierre_caja = TabCierreCaja(notebook, self)
+        
+        
+        self.tab_cierre_caja = cierre_peleteria.TabCierreDividido(notebook, self)
         notebook.add(self.tab_cierre_caja, text="💰 Cierre de caja")
 
         self.tab_reportes = TabReportes(notebook, self)
         notebook.add(self.tab_reportes, text="📈 Reportes")
+
+        self.tab_caja_pel = caja_peleteria.TabCajaPeleteria(notebook, self)
+        notebook.add(self.tab_caja_pel, text="🧵 Caja Peletería")
 
         self._construir_tab_caja()
         self._construir_tab_productos()
@@ -1069,10 +298,56 @@ class CajaRegistradoraApp(tk.Tk):
         self.refrescar_todo()
         self.after(200, lambda: self.ent_scan_codigo.focus_set())
 
+        # ---- Revisión periódica: si la otra caja guardó algo, se actualiza la pantalla ----
+        self._db_firma = self._firma_db()
+        self.after(INTERVALO_REVISION_MS, self._revisar_cambios_db)
+
+    # -----------------------------------------------------------------
+    # Pestañas: cambio y actualización automática
+    # -----------------------------------------------------------------
     def _al_cambiar_pestana(self, event=None):
-        if self.notebook.index(self.notebook.select()) == 0:
+        idx = self.notebook.index(self.notebook.select())
+        if idx == 0:
             self.cargar_catalogo()
             self.after(100, lambda: self.ent_scan_codigo.focus_set())
+        elif idx == 5:
+            self.cargar_credito()
+        elif idx == 6:
+            self.cargar_historial()
+
+    def _firma_db(self):
+        """Valor que cambia cuando alguien guarda algo."""
+        return db.firma_cambios()
+
+    def _revisar_cambios_db(self):
+        try:
+            firma = self._firma_db()
+            if firma is not None and firma != self._db_firma:
+                self._db_firma = firma
+                self._refrescar_pestana_visible()
+        except Exception:
+            pass
+        finally:
+            self.after(INTERVALO_REVISION_MS, self._revisar_cambios_db)
+
+    def _recargar_conservando(self, tree, recargar):
+        sel = tree.selection()
+        recargar()
+        if sel and tree.exists(sel[0]):
+            tree.selection_set(sel[0])
+
+    def _refrescar_pestana_visible(self):
+        idx = self.notebook.index(self.notebook.select())
+        if idx == 0:
+            self._recargar_conservando(self.tree_catalogo, self.cargar_catalogo)
+        elif idx == 5:
+            self.cargar_credito()
+        elif idx == 6:
+            self._recargar_conservando(self.tree_hist, self.cargar_historial)
+        elif idx == 7:
+            self.tab_cierre_caja.cargar()
+        elif idx == 8:
+            self.tab_reportes.cargar()
 
     # -----------------------------------------------------------------
     # Zoom (Ctrl+ / Ctrl- / Ctrl+0)
@@ -1190,6 +465,9 @@ class CajaRegistradoraApp(tk.Tk):
             except Exception:
                 pass
 
+    def abrir_calendario(self, entry):
+        CalendarioPopup(self, entry)
+
     # -----------------------------------------------------------------
     # TAB CAJA (punto de venta)
     # -----------------------------------------------------------------
@@ -1290,27 +568,27 @@ class CajaRegistradoraApp(tk.Tk):
         ttk.Button(cliente_frame, text="💾 Guardar como cliente nuevo",
                    command=self.guardar_cliente_desde_caja).grid(row=5, column=0, columnspan=3, padx=6, pady=(4, 6), sticky="ew")
 
-        # ---- Forma de pago (contado / crédito) ----
+        # ---- Forma de pago (contado / crédito) y método (efectivo / tarjeta / transferencia) ----
         pago_frame = ttk.Frame(der)
         pago_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(8, 0))
-        ttk.Label(pago_frame, text="Forma de pago:").pack(side="left")
-        self.combo_forma_pago = ttk.Combobox(
-            pago_frame, values=["Contado", "Crédito"], state="readonly", width=10
-        )
+
+        # El crédito ahora es solo para peletería: aquí todo es de contado.
+        self.combo_forma_pago = ttk.Combobox(pago_frame, values=["Contado"],
+                                             state="readonly", width=10)
         self.combo_forma_pago.set("Contado")
-        self.combo_forma_pago.pack(side="left", padx=6)
-        self.combo_forma_pago.bind("<<ComboboxSelected>>", self._al_cambiar_forma_pago)
-
-        ttk.Label(pago_frame, text="Método:").pack(side="left", padx=(12, 0))
-        self.combo_metodo_pago = ttk.Combobox(
-            pago_frame, values=METODOS_PAGO, state="readonly", width=13
-        )
-        self.combo_metodo_pago.set("Efectivo")
-        self.combo_metodo_pago.pack(side="left", padx=6)
-
-        ttk.Label(pago_frame, text="Abono inicial:").pack(side="left", padx=(12, 0))
         self.ent_abono_inicial = ttk.Entry(pago_frame, width=12, state="disabled")
-        self.ent_abono_inicial.pack(side="left", padx=6)
+
+        ttk.Label(pago_frame, text="Método de pago:").grid(row=0, column=0, sticky="e")
+        self.combo_metodo_pago = ttk.Combobox(pago_frame, values=METODOS_PAGO,
+                                              state="readonly", width=13)
+        self.combo_metodo_pago.set("Efectivo")
+        self.combo_metodo_pago.grid(row=0, column=1, padx=6, pady=2, sticky="w")
+
+        ttk.Label(pago_frame, text="Formato:").grid(row=1, column=0, sticky="e")
+        self.combo_formato = ttk.Combobox(pago_frame, values=["Factura PDF", "Ticket POS"],
+                                          state="readonly", width=13)
+        self.combo_formato.set("Factura PDF")
+        self.combo_formato.grid(row=1, column=1, padx=6, pady=2, sticky="w")
 
         total_frame = ttk.Frame(der)
         total_frame.grid(row=4, column=0, sticky="ew", padx=6, pady=10)
@@ -1335,11 +613,17 @@ class CajaRegistradoraApp(tk.Tk):
         conn = db.conectar()
         cur = conn.cursor()
         cur.execute("SELECT id, nombre, tipo, precio, stock FROM productos ORDER BY tipo, nombre")
-        configurar_filas_alternadas(self.tree_catalogo)
-        for i, (pid, nombre, tipo, precio, stock) in enumerate(cur.fetchall()):
-            self.tree_catalogo.insert("", "end", iid=str(pid), tags=(tag_fila(i),),
-                                       values=(nombre, tipo, formato_precio(precio), stock))
+        filas = cur.fetchall()
         conn.close()
+
+        configurar_filas_alternadas(self.tree_catalogo)
+        self.tree_catalogo.tag_configure("bajo", foreground=COLOR_STOCK_BAJO)
+        for i, (pid, nombre, tipo, precio, stock) in enumerate(filas):
+            bajo = stock <= STOCK_BAJO
+            self.tree_catalogo.insert(
+                "", "end", iid=str(pid),
+                tags=(tag_fila(i), "bajo") if bajo else (tag_fila(i),),
+                values=(nombre, tipo, formato_precio(precio), f"⚠ {stock}" if bajo else stock))
 
     def agregar_al_carrito(self):
         sel = self.tree_catalogo.selection()
@@ -1357,7 +641,8 @@ class CajaRegistradoraApp(tk.Tk):
         self._agregar_id_al_carrito(producto_id, cantidad)
 
     def escanear_codigo_barras(self, event=None):
-        """Busca coincidencias por código de barras exacto O por nombre parcial."""
+        """Busca coincidencias por código de barras exacto O por nombre parcial.
+        Si hay varias, el código exacto va primero."""
         busqueda = self.ent_scan_codigo.get().strip()
         self.ent_scan_codigo.delete(0, "end")
         if not busqueda:
@@ -1365,13 +650,12 @@ class CajaRegistradoraApp(tk.Tk):
 
         conn = db.conectar()
         cur = conn.cursor()
-
-        # Busca por código exacto O por texto dentro del nombre (insensible a mayúsculas/minúsculas)
         cur.execute("""
             SELECT id, nombre
             FROM productos
             WHERE codigo_barras = ? OR nombre LIKE ?
-        """, (busqueda, f"%{busqueda}%"))
+            ORDER BY (codigo_barras = ?) DESC, nombre
+        """, (busqueda, f"%{busqueda}%", busqueda))
 
         filas = cur.fetchall()
         conn.close()
@@ -1380,7 +664,7 @@ class CajaRegistradoraApp(tk.Tk):
             messagebox.showwarning(
                 "Producto no encontrado",
                 f"No se encontró ningún producto con el código o nombre '{busqueda}'.\n\n"
-                "Puedes asignarlo desde la pestaña 📦 Productos."
+                "Puedes asignarlo desde la pestaña 📦 Zapat."
             )
             self.ent_scan_codigo.focus_set()
             return
@@ -1417,7 +701,7 @@ class CajaRegistradoraApp(tk.Tk):
                 "producto_id": producto_id,
                 "nombre": nombre,
                 "precio": precio,
-                "precio_original": precio,   # Guarda el precio original para poder restaurarlo si se cambia
+                "precio_original": precio,   # para marcar los precios con descuento
                 "cantidad": cantidad,
             })
 
@@ -1479,8 +763,8 @@ class CajaRegistradoraApp(tk.Tk):
         def guardar(e=None):
             nuevo = a_numero(entry.get())
             if nuevo is None or nuevo <= 0:
+                cerrar()
                 messagebox.showerror("Precio inválido", "Escribe un precio mayor a 0.")
-                entry.focus_set()
                 return
             cerrar()
             self.carrito[idx]["precio"] = nuevo
@@ -1491,7 +775,6 @@ class CajaRegistradoraApp(tk.Tk):
         entry.bind("<FocusOut>", lambda e: cerrar())
 
     def cargar_combo_clientes_caja(self):
-
         conn = db.conectar()
         cur = conn.cursor()
         cur.execute("SELECT id, nombre, nit FROM clientes ORDER BY nombre")
@@ -1585,9 +868,10 @@ class CajaRegistradoraApp(tk.Tk):
 
         total = sum(i["precio"] * i["cantidad"] for i in self.carrito)
 
-        # ---- Forma de pago ----
+        # ---- Forma y método de pago ----
         es_credito = self.combo_forma_pago.get() == "Crédito"
         forma_pago = "Crédito" if es_credito else "Contado"
+        metodo_pago = self.combo_metodo_pago.get() or "Efectivo"
         abono_inicial = 0.0
 
         if es_credito:
@@ -1624,9 +908,9 @@ class CajaRegistradoraApp(tk.Tk):
                 self.cargar_combo_clientes_caja()
                 self.cargar_clientes()
 
-        detalle_pago = "Contado"
+        detalle_pago = f"Contado ({metodo_pago})"
         if es_credito:
-            detalle_pago = (f"Crédito (abono inicial {formato_precio(abono_inicial)}, "
+            detalle_pago = (f"Crédito (abono inicial {formato_precio(abono_inicial)} en {metodo_pago}, "
                             f"saldo {formato_precio(total - abono_inicial)})")
 
         if not messagebox.askyesno(
@@ -1639,20 +923,20 @@ class CajaRegistradoraApp(tk.Tk):
         cur = conn.cursor()
         try:
             cur.execute(
-                """INSERT INTO ventas (
-                    fecha, total, cliente_id, cliente_nombre, cliente_telefono, cliente_nit,
-                    cliente_correo, forma_pago, metodo_pago
-                   )
+                """INSERT INTO ventas (fecha, total, cliente_id, cliente_nombre, cliente_telefono, cliente_nit,
+                                      cliente_correo, forma_pago, metodo_pago)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (ahora(), total, self._cliente_seleccionado_id, cliente_nombre, cliente_telefono, cliente_nit,
-                 cliente_correo, forma_pago, self.combo_metodo_pago.get())
+                 cliente_correo, forma_pago, metodo_pago)
             )
             venta_id = cur.lastrowid
 
             for item in self.carrito:
-                cur.execute("SELECT stock FROM productos WHERE id = ?", (item["producto_id"],))
-                stock_actual = cur.fetchone()[0]
-                if stock_actual < item["cantidad"]:
+                # Descuento atómico: si otra caja vendió lo último un segundo antes,
+                # esta no se completa (nunca queda stock negativo).
+                cur.execute("UPDATE productos SET stock = stock - ? WHERE id = ? AND stock >= ?",
+                            (item["cantidad"], item["producto_id"], item["cantidad"]))
+                if cur.rowcount == 0:
                     raise ValueError(f"Stock insuficiente para '{item['nombre']}'.")
 
                 subtotal = item["precio"] * item["cantidad"]
@@ -1661,12 +945,10 @@ class CajaRegistradoraApp(tk.Tk):
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (venta_id, item["producto_id"], item["nombre"], item["cantidad"], item["precio"], subtotal))
 
-                cur.execute("UPDATE productos SET stock = stock - ? WHERE id = ?", (item["cantidad"], item["producto_id"]))
-
             if es_credito and abono_inicial > 0:
                 cur.execute(
                     "INSERT INTO abonos (venta_id, fecha, monto, nota, metodo_pago) VALUES (?, ?, ?, ?, ?)",
-                    (venta_id, ahora(), abono_inicial, "Abono inicial", self.combo_metodo_pago.get())
+                    (venta_id, ahora(), abono_inicial, "Abono inicial", metodo_pago)
                 )
 
             # Si es un cliente guardado, deja su correo actualizado
@@ -1679,15 +961,18 @@ class CajaRegistradoraApp(tk.Tk):
         except Exception as e:
             conn.rollback()
             messagebox.showerror("Error", f"Ocurrió un error al procesar la venta: {e}")
+            self.cargar_catalogo()
             return
         finally:
             conn.close()
 
-        # ---- La venta ya quedó guardada: factura, correo y limpieza ----
-               # ---- La venta ya quedó guardada: factura PDF, correo y limpieza ----
+        # ---- La venta ya quedó guardada: factura PDF, correo y limpieza ----
         ruta_pdf = None
         try:
-            ruta_pdf = factura.generar_factura_pdf(venta_id)
+            if self.combo_formato.get() == "Ticket POS":
+                ruta_pdf = factura.generar_ticket_pos(venta_id)
+            else:
+                ruta_pdf = factura.generar_factura_pdf(venta_id)
             factura.abrir_factura(ruta_pdf)
         except Exception as e:
             messagebox.showerror("Error al generar factura", f"No se pudo generar la factura: {e}")
@@ -1747,8 +1032,8 @@ class CajaRegistradoraApp(tk.Tk):
         for idx, (label_txt, var_name) in enumerate(fields):
             ttk.Label(form, text=label_txt).grid(row=idx, column=0, padx=6, pady=6, sticky="e")
             if var_name == "combo_prod_tipo":
-                widget = ttk.Combobox(form, values=["Zapato deportivo","Bolichero","Sandalia","Accesorio", "Otro"], state="readonly")
-                widget.set("Moño")
+                widget = ttk.Combobox(form, values=TIPOS_PRODUCTO, state="readonly")
+                widget.set(TIPOS_PRODUCTO[0])
             else:
                 widget = ttk.Entry(form)
             widget.grid(row=idx, column=1, padx=6, pady=6, sticky="ew")
@@ -1788,12 +1073,13 @@ class CajaRegistradoraApp(tk.Tk):
         conn = db.conectar()
         cur = conn.cursor()
         cur.execute("SELECT id, codigo_barras, nombre, tipo, precio, stock FROM productos ORDER BY id DESC")
+        filas = cur.fetchall()
+        conn.close()
         configurar_filas_alternadas(self.tree_productos_admin)
-        for i, row in enumerate(cur.fetchall()):
+        for i, row in enumerate(filas):
             pid, cod, nom, tipo, precio, stock = row
             self.tree_productos_admin.insert("", "end", iid=str(pid), tags=(tag_fila(i),),
                                               values=(pid, cod or "", nom, tipo, formato_precio(precio), stock))
-        conn.close()
 
     def _al_seleccionar_producto(self, event=None):
         sel = self.tree_productos_admin.selection()
@@ -1816,14 +1102,14 @@ class CajaRegistradoraApp(tk.Tk):
     def limpiar_form_producto(self):
         self.ent_prod_codigo.delete(0, "end")
         self.ent_prod_nombre.delete(0, "end")
-        self.combo_prod_tipo.set("Moño")
+        self.combo_prod_tipo.set(TIPOS_PRODUCTO[0])
         self.ent_prod_precio.delete(0, "end")
         self.ent_prod_stock.delete(0, "end")
         if self.tree_productos_admin.selection():
             self.tree_productos_admin.selection_remove(self.tree_productos_admin.selection())
 
     def guardar_producto(self):
-        codigo = self.ent_prod_codigo.get().strip()
+        codigo = self.ent_prod_codigo.get().strip() or None  # vacío = sin código (no choca con otros)
         nombre = self.ent_prod_nombre.get().strip()
         tipo = self.combo_prod_tipo.get().strip()
         try:
@@ -1840,35 +1126,51 @@ class CajaRegistradoraApp(tk.Tk):
         sel = self.tree_productos_admin.selection()
         conn = db.conectar()
         cur = conn.cursor()
-        if sel:
-            pid = int(sel[0])
-            cur.execute("""UPDATE productos SET codigo_barras=?, nombre=?, tipo=?, precio=?, stock=?
-                           WHERE id=?""", (codigo, nombre, tipo, precio, stock, pid))
-        else:
-            cur.execute("""INSERT INTO productos (codigo_barras, nombre, tipo, precio, stock)
-                           VALUES (?, ?, ?, ?, ?)""", (codigo, nombre, tipo, precio, stock))
-        conn.commit()
-        conn.close()
+        try:
+            if sel:
+                pid = int(sel[0])
+                cur.execute("""UPDATE productos SET codigo_barras=?, nombre=?, tipo=?, precio=?, stock=?
+                               WHERE id=?""", (codigo, nombre, tipo, precio, stock, pid))
+            else:
+                cur.execute("""INSERT INTO productos (codigo_barras, nombre, tipo, precio, stock)
+                               VALUES (?, ?, ?, ?, ?)""", (codigo, nombre, tipo, precio, stock))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("No se pudo guardar",
+                                 f"No se pudo guardar el producto (¿el código de barras ya existe?):\n{e}")
+            return
+        finally:
+            conn.close()
 
         self.limpiar_form_producto()
         self.cargar_productos_admin()
-        self.cargar_catalogo() 
+        self.cargar_catalogo()
 
     def eliminar_producto(self):
         sel = self.tree_productos_admin.selection()
         if not sel:
             messagebox.showwarning("Seleccionar", "Selecciona un producto para eliminar.")
             return
-        if messagebox.askyesno("Confirmar", "¿Deseas eliminar este producto?"):
-            pid = int(sel[0])
-            conn = db.conectar()
-            cur = conn.cursor()
+        if not messagebox.askyesno("Confirmar", "¿Deseas eliminar este producto?"):
+            return
+        pid = int(sel[0])
+        conn = db.conectar()
+        cur = conn.cursor()
+        try:
             cur.execute("DELETE FROM productos WHERE id = ?", (pid,))
             conn.commit()
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("No se pudo eliminar",
+                                 f"Este producto tiene ventas registradas y no se puede eliminar.\n\n{e}")
+            return
+        finally:
             conn.close()
-            self.limpiar_form_producto()
-            self.cargar_productos_admin()
-            self.cargar_catalogo()
+        self.limpiar_form_producto()
+        self.cargar_productos_admin()
+        self.cargar_catalogo()
+
     # -----------------------------------------------------------------
     # TAB MATERIALES
     # -----------------------------------------------------------------
@@ -1937,11 +1239,12 @@ class CajaRegistradoraApp(tk.Tk):
         else:
             cur.execute("""SELECT id, nombre, stock_actual, unidad, codigo_barras FROM materiales
                            ORDER BY nombre""")
+        filas = cur.fetchall()
+        conn.close()
         configurar_filas_alternadas(self.tree_mat)
-        for i, (mid, nom, cant, uni, cod) in enumerate(cur.fetchall()):
+        for i, (mid, nom, cant, uni, cod) in enumerate(filas):
             self.tree_mat.insert("", "end", iid=str(mid), tags=(tag_fila(i),),
                                  values=(mid, nom, cant, uni or "", cod or ""))
-        conn.close()
 
     def guardar_material(self):
         codigo = self.ent_mat_codigo.get().strip()
@@ -1958,17 +1261,23 @@ class CajaRegistradoraApp(tk.Tk):
 
         conn = db.conectar()
         cur = conn.cursor()
-        if codigo:
-            cur.execute("SELECT nombre FROM materiales WHERE codigo_barras = ?", (codigo,))
-            repetido = cur.fetchone()
-            if repetido:
-                conn.close()
-                messagebox.showerror("Código repetido", f"Ese código ya está asignado a '{repetido[0]}'.")
-                return
-        cur.execute("INSERT INTO materiales (codigo_barras, nombre, unidad, stock_actual) VALUES (?, ?, ?, ?)",
-                    (codigo or None, nom, uni, cant))
-        conn.commit()
-        conn.close()
+        try:
+            if codigo:
+                cur.execute("SELECT nombre FROM materiales WHERE codigo_barras = ?", (codigo,))
+                repetido = cur.fetchone()
+                if repetido:
+                    messagebox.showerror("Código repetido", f"Ese código ya está asignado a '{repetido[0]}'.")
+                    return
+            cur.execute("INSERT INTO materiales (codigo_barras, nombre, unidad, stock_actual) VALUES (?, ?, ?, ?)",
+                        (codigo or None, nom, uni or "unidad", cant))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("No se pudo guardar",
+                                 f"No se pudo guardar el material (¿ya existe uno con ese nombre?):\n{e}")
+            return
+        finally:
+            conn.close()
 
         self.ent_mat_codigo.delete(0, "end")
         self.ent_mat_nombre.delete(0, "end")
@@ -1985,9 +1294,15 @@ class CajaRegistradoraApp(tk.Tk):
             return
         conn = db.conectar()
         cur = conn.cursor()
-        cur.execute("DELETE FROM materiales WHERE id = ?", (sel[0],))
-        conn.commit()
-        conn.close()
+        try:
+            cur.execute("DELETE FROM materiales WHERE id = ?", (sel[0],))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("No se pudo eliminar", f"No se pudo eliminar el material:\n{e}")
+            return
+        finally:
+            conn.close()
         self.cargar_materiales()
 
     # -----------------------------------------------------------------
@@ -2033,10 +1348,11 @@ class CajaRegistradoraApp(tk.Tk):
         conn = db.conectar()
         cur = conn.cursor()
         cur.execute("SELECT id, nombre, nit, COALESCE(correo, ''), telefono, direccion FROM clientes ORDER BY nombre")
-        configurar_filas_alternadas(self.tree_cli)
-        for i, row in enumerate(cur.fetchall()):
-            self.tree_cli.insert("", "end", iid=str(row[0]), tags=(tag_fila(i),), values=row)
+        filas = cur.fetchall()
         conn.close()
+        configurar_filas_alternadas(self.tree_cli)
+        for i, row in enumerate(filas):
+            self.tree_cli.insert("", "end", iid=str(row[0]), tags=(tag_fila(i),), values=row)
 
     def guardar_cliente(self):
         nom = self.ent_c_nombre.get().strip()
@@ -2069,195 +1385,57 @@ class CajaRegistradoraApp(tk.Tk):
     def eliminar_cliente(self):
         sel = self.tree_cli.selection()
         if not sel:
+            messagebox.showwarning("Seleccionar", "Selecciona un cliente para eliminar.")
+            return
+        if not messagebox.askyesno("Confirmar", "¿Deseas eliminar este cliente?"):
             return
         conn = db.conectar()
         cur = conn.cursor()
-        cur.execute("DELETE FROM clientes WHERE id = ?", (sel[0],))
-        conn.commit()
-        conn.close()
+        try:
+            cur.execute("DELETE FROM clientes WHERE id = ?", (sel[0],))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            messagebox.showerror("No se pudo eliminar",
+                                 f"Este cliente tiene ventas registradas y no se puede eliminar.\n\n{e}")
+            return
+        finally:
+            conn.close()
         self.refrescar_todo()
 
     # -----------------------------------------------------------------
     # TAB CRÉDITO (ventas a crédito y abonos)
     # -----------------------------------------------------------------
+       # -----------------------------------------------------------------
+    # TAB CRÉDITO (solo peletería)
+    # -----------------------------------------------------------------
     def _construir_tab_credito(self):
-        frame = self.tab_credito
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(1, weight=2)
-        frame.rowconfigure(2, weight=1)
-
-        top = ttk.Frame(frame)
-        top.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-
-        ttk.Label(top, text="Cliente:").pack(side="left", padx=4)
-        self.ent_cred_cliente = ttk.Entry(top, width=22)
-        self.ent_cred_cliente.pack(side="left", padx=4)
-        self.ent_cred_cliente.bind("<Return>", lambda e: self.cargar_credito())
-
-        self.var_solo_pendientes = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Solo con saldo pendiente", variable=self.var_solo_pendientes,
-                        command=self.cargar_credito).pack(side="left", padx=10)
-        ttk.Button(top, text="Buscar", command=self.cargar_credito).pack(side="left", padx=4)
-
-        self.lbl_por_cobrar = ttk.Label(top, text="Por cobrar: $0", style="Subtitulo.TLabel")
-        self.lbl_por_cobrar.pack(side="right", padx=6)
-
-        cols = ("id", "fecha", "cliente", "total", "abonado", "saldo")
-        self.tree_cred = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
-        for c, txt, w, anchor in [
-            ("id", "Venta #", 70, "center"),
-            ("fecha", "Fecha", 150, "center"),
-            ("cliente", "Cliente", 220, "w"),
-            ("total", "Total", 100, "center"),
-            ("abonado", "Abonado", 100, "center"),
-            ("saldo", "Saldo", 100, "center"),
-        ]:
-            self.tree_cred.heading(c, text=txt)
-            self.tree_cred.column(c, width=w, anchor=anchor)
-        self.tree_cred.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        self.tree_cred.bind("<<TreeviewSelect>>", self.cargar_abonos_venta)
-
-        abajo = ttk.LabelFrame(frame, text="Abonos de la venta seleccionada")
-        abajo.grid(row=2, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        abajo.columnconfigure(0, weight=1)
-        abajo.rowconfigure(0, weight=1)
-
-        cols2 = ("fecha", "monto", "nota")
-        self.tree_abonos = ttk.Treeview(abajo, columns=cols2, show="headings", selectmode="browse", height=4)
-        for c, txt, w, anchor in [
-            ("fecha", "Fecha", 150, "center"),
-            ("monto", "Monto", 110, "center"),
-            ("nota", "Nota", 250, "w"),
-        ]:
-            self.tree_abonos.heading(c, text=txt)
-            self.tree_abonos.column(c, width=w, anchor=anchor)
-        self.tree_abonos.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-
-        ttk.Button(abajo, text="💵 Registrar abono", command=self.registrar_abono).grid(
-            row=0, column=1, padx=10, pady=6, sticky="n")
+        self.tab_credito.rowconfigure(0, weight=1)
+        self.tab_credito.columnconfigure(0, weight=1)
+        self.panel_credito = PanelCreditoPeleteria(self.tab_credito, self)
+        self.panel_credito.grid(row=0, column=0, sticky="nsew")
 
     def cargar_credito(self):
-        seleccionada = self.tree_cred.selection()
-        for item in self.tree_cred.get_children():
-            self.tree_cred.delete(item)
-
-        filtro = self.ent_cred_cliente.get().strip()
-        solo_pendientes = self.var_solo_pendientes.get()
-
-        conn = db.conectar()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT v.id, v.fecha, v.cliente_nombre, v.total,
-                   COALESCE((SELECT SUM(a.monto) FROM abonos a WHERE a.venta_id = v.id), 0)
-            FROM ventas v
-            WHERE v.forma_pago = 'Crédito'
-              AND COALESCE(v.estado, 'Activa') = 'Activa'
-              AND v.cliente_nombre LIKE ?
-            ORDER BY v.id DESC
-        """, (f"%{filtro}%",))
-        filas = cur.fetchall()
-        conn.close()
-
-        configurar_filas_alternadas(self.tree_cred)
-        por_cobrar = 0
-        indice = 0
-        for vid, fecha, cliente, total, abonado in filas:
-            saldo = total - abonado
-            if solo_pendientes and saldo <= 0:
-                continue
-            por_cobrar += max(saldo, 0)
-            self.tree_cred.insert("", "end", iid=str(vid), tags=(tag_fila(indice),),
-                                  values=(vid, fecha, cliente, formato_precio(total),
-                                          formato_precio(abonado), formato_precio(saldo)))
-            indice += 1
-
-        self.lbl_por_cobrar.config(text=f"Por cobrar: {formato_precio(por_cobrar)}")
-
-        if seleccionada and self.tree_cred.exists(seleccionada[0]):
-            self.tree_cred.selection_set(seleccionada[0])
-        else:
-            self.cargar_abonos_venta()
-
-    def cargar_abonos_venta(self, event=None):
-        for item in self.tree_abonos.get_children():
-            self.tree_abonos.delete(item)
-        sel = self.tree_cred.selection()
-        if not sel:
-            return
-        conn = db.conectar()
-        cur = conn.cursor()
-        cur.execute("SELECT fecha, monto, COALESCE(nota, '') FROM abonos WHERE venta_id = ? ORDER BY id",
-                    (sel[0],))
-        configurar_filas_alternadas(self.tree_abonos)
-        for i, (fecha, monto, nota) in enumerate(cur.fetchall()):
-            self.tree_abonos.insert("", "end", tags=(tag_fila(i),),
-                                    values=(fecha, formato_precio(monto), nota))
-        conn.close()
-
-    def registrar_abono(self):
-        sel = self.tree_cred.selection()
-        if not sel:
-            messagebox.showwarning("Seleccionar", "Selecciona una venta a crédito de la lista.")
-            return
-        venta_id = int(sel[0])
-
-        conn = db.conectar()
-        cur = conn.cursor()
-        cur.execute("SELECT total, cliente_nombre FROM ventas WHERE id = ?", (venta_id,))
-        fila = cur.fetchone()
-        cur.execute("SELECT COALESCE(SUM(monto), 0) FROM abonos WHERE venta_id = ?", (venta_id,))
-        abonado = cur.fetchone()[0]
-        conn.close()
-        if not fila:
-            return
-        total, cliente = fila
-        saldo = total - abonado
-
-        if saldo <= 0:
-            messagebox.showinfo("Cuenta saldada", "Esta venta ya está pagada por completo.")
-            return
-
-        pago = pedir_monto_y_metodo(
-            self,
-            "Registrar abono",
-            f"Cliente: {cliente}\nSaldo pendiente: {formato_precio(saldo)}\n\n"
-            "Ingresa el monto y el método de pago."
-        )
-        if pago is None:
-            return
-
-        texto, metodo_abono = pago
-        monto = a_numero(texto)
-        if not monto or monto <= 0:
-            messagebox.showerror("Monto inválido", "Escribe un monto mayor a 0.")
-            return
-        if monto > saldo:
-            messagebox.showerror("Monto muy alto",
-                                 f"El abono no puede superar el saldo pendiente ({formato_precio(saldo)}).")
-            return
-
-        conn = db.conectar()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO abonos (venta_id, fecha, monto, nota, metodo_pago) VALUES (?, ?, ?, ?, ?)",
-            (venta_id, ahora(), monto, "Abono", metodo_abono)
-        )
-        conn.commit()
-        conn.close()
-
-        nuevo_saldo = saldo - monto
-        if nuevo_saldo <= 0:
-            messagebox.showinfo("Abono registrado", "Abono registrado. ¡La cuenta quedó saldada!")
-        else:
-            messagebox.showinfo("Abono registrado",
-                                f"Abono registrado.\nNuevo saldo: {formato_precio(nuevo_saldo)}")
-        self.cargar_credito()
-
-    # -----------------------------------------------------------------
+        if getattr(self, "panel_credito", None):
+            self.panel_credito.cargar()
+            
+        # ----------------------------------------------------------------
     # TAB HISTORIAL
     # -----------------------------------------------------------------
     def _construir_tab_historial(self):
-        frame = self.tab_historial
+        base = self.tab_historial
+        base.rowconfigure(0, weight=1)
+        base.columnconfigure(0, weight=1)
+
+        sub = ttk.Notebook(base, style="Rosa.TNotebook")
+        sub.grid(row=0, column=0, sticky="nsew")
+        self.sub_hist_zap = ttk.Frame(sub)
+        self.sub_hist_pel = ttk.Frame(sub)
+        sub.add(self.sub_hist_zap, text="👞 Zapatería")
+        sub.add(self.sub_hist_pel, text="🧵 Peletería")
+
+        # ---------- Zapatería (tu historial de siempre) ----------
+        frame = self.sub_hist_zap
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
@@ -2267,26 +1445,32 @@ class CajaRegistradoraApp(tk.Tk):
         ttk.Label(top, text="Filtrar por fecha:").pack(side="left", padx=4)
         self.ent_hist_fecha = ttk.Entry(top, width=12)
         self.ent_hist_fecha.pack(side="left", padx=4)
-        ttk.Button(top, text="📅", width=3, command=lambda: CalendarioPopup(self, self.ent_hist_fecha)).pack(side="left")
+        ttk.Button(top, text="📅", width=3,
+                   command=lambda: CalendarioPopup(self, self.ent_hist_fecha)).pack(side="left")
 
         ttk.Button(top, text="Buscar", command=self.cargar_historial).pack(side="left", padx=6)
-        ttk.Button(top, text="Ver todas", command=self._ver_todas_historial).pack(side="left")
-        ttk.Button(top, text="Reimprimir Factura", command=self.reimprimir_factura).pack(side="right", padx=6)
+        ttk.Button(top, text="🧾 Ticket POS", command=self.reimprimir_ticket_pos).pack(side="right", padx=6)
         ttk.Button(top, text="✉ Enviar por correo", command=self.enviar_factura_por_correo).pack(side="right", padx=6)
         ttk.Button(top, text="↩ Anular / devolver", command=self.anular_devolver_venta).pack(side="right", padx=6)
 
-        cols = ("id", "fecha", "cliente", "total", "estado")
+        cols = ("id", "fecha", "cliente", "total", "estado", "motivo")
         self.tree_hist = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
         for c, txt, w in [
             ("id", "Venta #", 70),
             ("fecha", "Fecha", 150),
-            ("cliente", "Cliente", 220),
+            ("cliente", "Cliente", 200),
             ("total", "Total", 100),
-            ("estado", "Estado", 100),
+            ("estado", "Estado", 90),
+            ("motivo", "Motivo", 220),
         ]:
             self.tree_hist.heading(c, text=txt)
-            self.tree_hist.column(c, width=w, anchor="center" if c != "cliente" else "w")
+            self.tree_hist.column(c, width=w, anchor="w" if c in ("cliente", "motivo") else "center")
         self.tree_hist.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+
+        # ---------- Peletería ----------
+        self.panel_hist_pel = PanelHistorialPeleteria(
+            self.sub_hist_pel, self, lambda ent: CalendarioPopup(self, ent))
+        self.panel_hist_pel.pack(fill="both", expand=True)
 
     def _ver_todas_historial(self):
         self.ent_hist_fecha.delete(0, "end")
@@ -2296,66 +1480,58 @@ class CajaRegistradoraApp(tk.Tk):
         for item in self.tree_hist.get_children():
             self.tree_hist.delete(item)
         fecha_filtro = self.ent_hist_fecha.get().strip()
+        columnas = ("id, fecha, cliente_nombre, total, COALESCE(estado, 'Activa'), "
+                    + db.col_o_vacio("ventas", "motivo_anulacion"))
 
         conn = db.conectar()
         cur = conn.cursor()
         if fecha_filtro:
-            cur.execute("""SELECT id, fecha, cliente_nombre, total,
-                                  COALESCE(estado, 'Activa')
-                           FROM ventas
-                           WHERE fecha LIKE ? ORDER BY id DESC""", (f"{fecha_filtro}%",))
+            cur.execute(f"SELECT {columnas} FROM ventas WHERE fecha LIKE ? ORDER BY id DESC",
+                        (f"{fecha_filtro}%",))
         else:
-            cur.execute("""SELECT id, fecha, cliente_nombre, total,
-                                  COALESCE(estado, 'Activa')
-                           FROM ventas ORDER BY id DESC""")
+            cur.execute(f"SELECT {columnas} FROM ventas ORDER BY id DESC")
+        filas = cur.fetchall()
+        conn.close()
 
         configurar_filas_alternadas(self.tree_hist)
-        for i, row in enumerate(cur.fetchall()):
-            vid, fec, cli, tot, estado = row
-            self.tree_hist.insert("", "end", iid=str(vid), tags=(tag_fila(i),),
-                                  values=(vid, fec, cli, formato_precio(tot), estado))
-        conn.close()
+        self.tree_hist.tag_configure("anulada", foreground=COLOR_ANULADA)
+        for i, (vid, fec, cli, tot, estado, motivo) in enumerate(filas):
+            tags = ("anulada",) if estado != "Activa" else (tag_fila(i),)
+            self.tree_hist.insert("", "end", iid=str(vid), tags=tags,
+                                  values=(vid, fec, cli, formato_precio(tot), estado, motivo))
+
+        if getattr(self, "panel_hist_pel", None):
+            self.panel_hist_pel.cargar()
 
     def anular_devolver_venta(self):
         sel = self.tree_hist.selection()
         if not sel:
             messagebox.showwarning("Seleccionar", "Selecciona una venta del historial.")
             return
-
         venta_id = int(sel[0])
+
         conn = db.conectar()
         try:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT cliente_nombre, total, COALESCE(estado, 'Activa') "
-                "FROM ventas WHERE id = ?",
-                (venta_id,)
-            )
+            cur.execute("SELECT cliente_nombre, total, fecha, COALESCE(estado, 'Activa') "
+                        "FROM ventas WHERE id = ?", (venta_id,))
             fila = cur.fetchone()
         finally:
             conn.close()
 
-        if estado_venta(venta_id) != "Activa":
-            messagebox.showwarning("No permitido", "Esta venta ya está anulada o devuelta; no se puede eliminar.")
-            return
-
         if not fila:
             messagebox.showerror("Venta no encontrada", "La venta seleccionada ya no existe.")
             return
-
-        cliente, total, estado_actual = fila
+        cliente, total, fecha, estado_actual = fila
         if estado_actual != "Activa":
-            messagebox.showinfo(
-                "Venta ya procesada",
-                f"La venta #{venta_id} ya está marcada como {estado_actual}."
-            )
+            messagebox.showinfo("Venta ya procesada",
+                                f"La venta #{venta_id} ya está marcada como {estado_actual}.")
             return
 
-        if not seguridad.pedir_clave(self, "anular o devolver la venta"):
-            return
-
-        decision = pedir_anulacion(self, venta_id, cliente, total)
+        decision = caja_extra.pedir_anulacion(self, venta_id, cliente, total)
         if not decision:
+            return
+        if not seguridad.pedir_clave(self, "anular o devolver la venta"):
             return
 
         estado, motivo = decision
@@ -2363,16 +1539,15 @@ class CajaRegistradoraApp(tk.Tk):
             anular_venta_db(venta_id, estado, motivo)
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo procesar la venta: {e}")
+            self.refrescar_todo()
             return
 
-        messagebox.showinfo(
-            "Venta actualizada",
-            f"La venta #{venta_id} quedó marcada como {estado} y los productos regresaron al stock."
-        )
-        self.cargar_historial()
-        self.cargar_catalogo()
-        self.cargar_productos_admin()
-        self.cargar_credito()
+        aviso = f"La venta #{venta_id} quedó marcada como {estado} y los productos regresaron al stock."
+        if not str(fecha).startswith(datetime.now().strftime("%Y-%m-%d")):
+            aviso += ("\n\nOjo: la venta es de otro día. Si devolviste dinero en efectivo, "
+                      "regístralo como Retiro en la pestaña Cierre de caja.")
+        messagebox.showinfo("Venta actualizada", aviso)
+        self.refrescar_todo()
 
     def reimprimir_factura(self):
         sel = self.tree_hist.selection()
@@ -2381,7 +1556,7 @@ class CajaRegistradoraApp(tk.Tk):
             return
         venta_id = int(sel[0])
 
-        if estado_venta(venta_id) != "Activa":
+        if caja_extra.estado_venta(venta_id) != "Activa":
             messagebox.showwarning("Venta anulada", "Esta venta está anulada o devuelta; no se genera factura.")
             return
 
@@ -2390,6 +1565,19 @@ class CajaRegistradoraApp(tk.Tk):
             factura.abrir_factura(ruta_pdf)
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo volver a generar la factura: {e}")
+
+    def reimprimir_ticket_pos(self):
+        sel = self.tree_hist.selection()
+        if not sel:
+            messagebox.showwarning("Seleccionar", "Selecciona una venta del historial para el ticket.")
+            return
+        venta_id = int(sel[0])
+        try:
+            ruta = factura.generar_ticket_pos(venta_id)
+            factura.abrir_factura(ruta)
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo generar el ticket POS: {e}")
+
     def enviar_factura_por_correo(self):
         sel = self.tree_hist.selection()
         if not sel:
@@ -2397,7 +1585,7 @@ class CajaRegistradoraApp(tk.Tk):
             return
         venta_id = int(sel[0])
 
-        if estado_venta(venta_id) != "Activa":
+        if caja_extra.estado_venta(venta_id) != "Activa":
             messagebox.showwarning("Venta anulada", "Esta venta está anulada o devuelta; no se genera factura.")
             return
 
@@ -2444,50 +1632,10 @@ class CajaRegistradoraApp(tk.Tk):
             conn.close()
         messagebox.showinfo("Factura enviada", f"Factura enviada a {destino}.")
 
-    def eliminar_venta(self):
-        sel = self.tree_hist.selection()
-        if not sel:
-            messagebox.showwarning("Seleccionar", "Selecciona una venta del historial para eliminar.")
-            return
-        venta_id = int(sel[0])
-
-        if not messagebox.askyesno(
-                "Eliminar venta",
-                f"¿Eliminar la venta #{venta_id}?\n\n"
-                "Los productos vuelven al stock y se borran sus abonos.\n"
-                "Esta acción no se puede deshacer."):
-            return
-        if not seguridad.pedir_clave(self, "eliminar la venta"):
-            return
-
-        conn = db.conectar()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT producto_id, cantidad FROM venta_detalle WHERE venta_id = ?", (venta_id,))
-            for producto_id, cantidad in cur.fetchall():
-                cur.execute("UPDATE productos SET stock = stock + ? WHERE id = ?", (cantidad, producto_id))
-            cur.execute("DELETE FROM abonos WHERE venta_id = ?", (venta_id,))
-            cur.execute("DELETE FROM venta_detalle WHERE venta_id = ?", (venta_id,))
-            cur.execute("DELETE FROM ventas WHERE id = ?", (venta_id,))
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            messagebox.showerror("Error", f"No se pudo eliminar la venta: {e}")
-            return
-        finally:
-            conn.close()
-
-        self.refrescar_todo()
-
-
-    def abrir_calendario(self, entry):
-        CalendarioPopup(self, entry)
-
     # -----------------------------------------------------------------
     # Refresco General
     # -----------------------------------------------------------------
     def refrescar_todo(self):
-        """Actualiza las vistas existentes sin depender de pestañas opcionales."""
         self.cargar_catalogo()
         self.cargar_combo_clientes_caja()
         self.cargar_productos_admin()
@@ -2497,7 +1645,11 @@ class CajaRegistradoraApp(tk.Tk):
         self.cargar_historial()
         if hasattr(self, "tab_entradas"):
             self.tab_entradas.cargar()
-        
+        if hasattr(self, "tab_cierre_caja"):
+            self.tab_cierre_caja.cargar()
+        if hasattr(self, "tab_reportes"):
+            self.tab_reportes.cargar()
+
 
 # ---------------------------------------------------------------------------
 # Punto de entrada de la aplicación
@@ -2510,8 +1662,10 @@ if __name__ == "__main__":
         messagebox.showerror("Base de datos no disponible", problema)
         raiz.destroy()
         sys.exit(1)
+
     db.inicializar_db()
-    asegurar_esquema()
-    asegurar_tablas()
     app = CajaRegistradoraApp()
+    if auto_migracion:
+        app.after(800, lambda: auto_migracion.migrar_datos_locales_si_hay(app, app.refrescar_todo))
     app.mainloop()
+    
